@@ -17,7 +17,7 @@ An automated tool to monitor and notify when seats become available in Miami Uni
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/[your-username]/MUSeatFinder.git
+   git clone https://github.com/[DylanBKendall/MUSeatFinder.git
    ```
 
 2. Navigate to the project directory:
