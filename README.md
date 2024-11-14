@@ -9,7 +9,7 @@ An automated tool to monitor and notify when seats become available in Miami Uni
 - Miami University authentication integration
 
 ## Prerequisites
-- Node.js (v16 or higher)
+- Node.js (v16 or higher) https://nodejs.org/en/download/prebuilt-installer
 - A Miami University email account (@miamioh.edu)
 - Connection to Miami University network (either on campus or via VPN)
 
