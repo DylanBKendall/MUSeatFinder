@@ -10,6 +10,7 @@ An automated tool to monitor and notify when seats become available in Miami Uni
 
 ## Prerequisites
 - Node.js (v16 or higher) https://nodejs.org/en/download/prebuilt-installer
+- Git https://gitforwindows.org/
 - A Miami University email account (@miamioh.edu)
 - Connection to Miami University network (either on campus or via VPN)
 
