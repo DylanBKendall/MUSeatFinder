@@ -57,4 +57,4 @@ The program requires one of the following:
 3. Connection to MU-WIRELESS
 
 ## Author
-[Dylan Kendall]
+Dylan Kendall

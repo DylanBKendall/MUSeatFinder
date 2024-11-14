@@ -184,8 +184,6 @@ async function sendEmailNotification(crn, current, max, email) {
             Current enrollment: ${current}/${max}
             Available seats: ${max - current}
             
-            Register now at: ${MIAMI_COURSE_URL}
-            
             Note: This is an automated message from the MU Seat Finder application.
         `
     };
