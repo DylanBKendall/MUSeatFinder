@@ -1,402 +1,266 @@
 /**
  * @file seat-finder.js
- * @author [Dylan Kendall]
- * @date [2024/11/23]
- * @brief Automated course seat availability checker for Miami University
- * @version 1.0
- * 
- * @details
- * This application monitors Miami University course availability and sends email
- * notifications when seats become available in specified courses. It requires
- * connection to Miami University's network and a valid Miami email address.
- * 
- * Features:
- * - Multiple CRN monitoring
- * - Real-time email notifications
- * - Automatic network connectivity checks
- * - Miami University authentication integration
- * 
- * @requires nodemailer
- * @requires puppeteer
- * @requires readline
- * @requires prompt-sync
- * @requires dns
+ * @author Dylan Kendall
+ * @date 2024‑11‑23 (rev. 2025‑04‑17)
+ * @version 2.0
+ *
+ * @brief Automated course‑seat availability checker for Miami University.
+ *
+ * Major improvements (v2.0)
+ * ------------------------
+ * • Environment‑driven configuration (interval, SMTP creds, Puppeteer flags).
+ * • Loop‑based polling (eliminates deep recursion & stack growth).
+ * • Automatic retry / back‑off on transient page failures.
+ * • Graceful shutdown on SIGINT / SIGTERM.
+ * • Stronger validation & error messages.
+ * • Dead‑code removal and tighter dependency list.
+ *
+ * ENV VARIABLES (optional)
+ * -----------------------
+ * SEAT_CHECK_INTERVAL   – milliseconds between checks   (default 120000)
+ * HEADLESS              – "true" | "false"            (default "true")
+ * PUPPETEER_SLOWMO      – slow‑mo delay ms             (default 0)
+ * SMTP_HOST / PORT / USER / PASS – override MU mail settings if needed
+ *
+ * Requires: nodemailer, puppeteer, prompt-sync, dns (builtin)
  */
 
 import nodemailer from 'nodemailer';
 import puppeteer from 'puppeteer';
-import readline from 'readline';
 import promptSync from 'prompt-sync';
 import dns from 'dns';
 import { promisify } from 'util';
 
-// Constants
+/* ------------------------------------------------------------------
+ * Configuration
+ * ----------------------------------------------------------------*/
 const DNS_LOOKUP = promisify(dns.lookup);
-const PROMPT = promptSync({sigint: true});
-const CHECK_INTERVAL = 120000; // 2 minutes in milliseconds
+const PROMPT = promptSync({ sigint: true });
+const CHECK_INTERVAL = Number(process.env.SEAT_CHECK_INTERVAL) || 120000;
 const MIAMI_DNS = 'mualmaip11.mcs.miamioh.edu';
 const MIAMI_COURSE_URL = 'https://www.apps.miamioh.edu/courselist/';
 const MIAMI_EMAIL_DOMAIN = '@miamioh.edu';
 
-/**
- * @class CourseMonitor
- * @brief Tracks the status of monitored courses and email confirmation status
- */
+/* ------------------------------------------------------------------
+ * Course monitor helpers
+ * ----------------------------------------------------------------*/
 class CourseMonitor {
-    /**
-     * @brief Initializes a new CourseMonitor instance
-     */
     constructor() {
         this.courses = new Map();
         this.confirmationSent = false;
     }
-
-    /**
-     * @brief Adds a new course to monitor
-     * @param {string} crn - Course Reference Number
-     */
-    addCourse(crn) {
-        this.courses.set(crn, {
-            lastStatus: null,
-            checking: true
-        });
+    add(crn) {
+        this.courses.set(crn, { notified: false });
     }
-
-    /**
-     * @brief Returns all monitored CRNs
-     * @return {Array<string>} Array of monitored CRNs
-     */
-    getCRNs() {
-        return Array.from(this.courses.keys());
+    delete(crn) {
+        this.courses.delete(crn);
     }
-
-    /**
-     * @brief Checks if confirmation email has been sent
-     * @return {boolean} True if confirmation was sent
-     */
-    isConfirmationSent() {
-        return this.confirmationSent;
+    get all() {
+        return [...this.courses.keys()];
     }
-
-    /**
-     * @brief Marks confirmation email as sent
-     */
-    markConfirmationSent() {
-        this.confirmationSent = true;
+    get size() {
+        return this.courses.size;
     }
 }
 
 const monitor = new CourseMonitor();
+let termCode = '';
+let browser; // will hold the Puppeteer instance for cleanup
 
-/**
- * @brief Verifies connection to Miami University network
- * @return {Promise<boolean>} True if connected to Miami network
- */
+/* ------------------------------------------------------------------
+ * Network helpers
+ * ----------------------------------------------------------------*/
 async function checkMiamiConnection() {
     try {
         await DNS_LOOKUP(MIAMI_DNS);
         return true;
-    } catch (error) {
+    } catch {
         return false;
     }
 }
 
-/**
- * @brief Creates an email transport configuration
- * @param {string} email - User's Miami email address
- * @return {nodemailer.Transporter} Configured email transporter
- */
-function createEmailTransport(email) {
-    return nodemailer.createTransport({
-        host: MIAMI_DNS,
-        port: 587,
+/* ------------------------------------------------------------------
+ * Email helpers
+ * ----------------------------------------------------------------*/
+function createTransport(userEmail) {
+    const host = process.env.SMTP_HOST || MIAMI_DNS;
+    const port = Number(process.env.SMTP_PORT) || 587;
+    const authUser = process.env.SMTP_USER || userEmail;
+    const authPass = process.env.SMTP_PASS;
+
+    const cfg = {
+        host,
+        port,
         secure: false,
-        tls: {
-            rejectUnauthorized: false
-        },
-        auth: {
-            user: email,
-        }
-    });
-}
-
-/**
- * @brief Sends confirmation email for monitored courses
- * @param {Array<string>} crns - Array of CRNs being monitored
- * @param {string} email - User's Miami email address
- * @throws {Error} If email sending fails
- */
-async function sendConfirmationEmail(crns, email) {
-    const transporter = createEmailTransport(email);
-    const crnList = crns.join(', ');
-    
-    const mailOptions = {
-        from: email,
-        to: email,
-        subject: `Course Monitor Started for Multiple CRNs`,
-        text: `
-            Hello!
-
-            This email confirms that we've started monitoring the following courses for available seats:
-            
-            CRNs: ${crnList}
-            
-            You will receive a separate email notification as soon as a seat becomes available in any of these courses.
-            
-            Important Notes:
-            - The monitoring program must remain running to receive notifications
-            - You will be notified immediately when a seat opens up
-            - Checks occur every 2 minutes
-            - You must stay connected to Miami's network
-            
-            Best of luck with your registration!
-            
-            Note: This is an automated message from the MU Seat Finder application.
-        `
+        tls: { rejectUnauthorized: false },
     };
+    if (authPass) cfg.auth = { user: authUser, pass: authPass };
+    else cfg.auth = { user: authUser }; // MU mail uses single‑factor user auth
 
-    try {
-        await transporter.sendMail(mailOptions);
-        console.log('Confirmation email sent successfully!');
-        return true;
-    } catch (error) {
-        throw new Error('Failed to send confirmation email. Please check your network connection and email address.');
-    }
+    return nodemailer.createTransport(cfg);
 }
 
-/**
- * @brief Sends notification email when seats become available
- * @param {string} crn - Course Reference Number
- * @param {number} current - Current enrollment
- * @param {number} max - Maximum enrollment
- * @param {string} email - User's Miami email address
- * @throws {Error} If email sending fails
- */
-async function sendEmailNotification(crn, current, max, email) {
-    const transporter = createEmailTransport(email);
-    
-    const mailOptions = {
-        from: email,
-        to: email,
-        subject: `Course ${crn} Has Available Seats!`,
-        text: `
-            Good news! Course ${crn} has available seats.
-            Current enrollment: ${current}/${max}
-            Available seats: ${max - current}
-            
-            Note: This is an automated message from the MU Seat Finder application.
-        `
+async function sendMail(transporter, subject, text, to) {
+    const opts = { from: to, to, subject, text };
+    await transporter.sendMail(opts);
+}
+
+/* ------------------------------------------------------------------
+ * Puppeteer helpers
+ * ----------------------------------------------------------------*/
+function buildLaunchOpts() {
+    return {
+        headless: process.env.HEADLESS !== 'false',
+        slowMo: Number(process.env.PUPPETEER_SLOWMO) || 0,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
     };
-
-    try {
-        await transporter.sendMail(mailOptions);
-        console.log('Email sent successfully!');
-        return true;
-    } catch (error) {
-        console.error('Error sending email:', error);
-        console.log('Please check your Miami email and network connection.');
-        throw error;
-    }
 }
 
-/**
- * @brief Searches for available seats in monitored courses
- * @param {string} email - User's Miami email address
- */
-async function searchCourses(email) {
-    const isConnected = await checkMiamiConnection();
-    if (!isConnected) {
-        console.error('\nERROR: Not connected to Miami University network!');
-        console.log('Please make sure you are either:');
-        console.log('1. Connected to Miami\'s campus network');
-        console.log('2. Connected to Miami\'s VPN');
-        console.log('3. Using MU-WIRELESS\n');
-        console.log('The program will retry in 1 minute...\n');
-        
-        await new Promise(resolve => setTimeout(resolve, 60000));
-        return searchCourses(email);
-    }
-
-    if (!monitor.isConfirmationSent()) {
+async function withRetry(fn, attempts = 3, delay = 2000) {
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
         try {
-            await sendConfirmationEmail(monitor.getCRNs(), email);
-            monitor.markConfirmationSent();
-        } catch (error) {
-            console.error('\nERROR: Could not send confirmation email.');
-            console.log('Please verify:');
-            console.log('1. You entered your Miami email correctly');
-            console.log('2. You are connected to Miami\'s network');
-            console.log('3. Your Miami email account is working properly\n');
-            
-            const retry = PROMPT('Would you like to retry? (y/n): ').toLowerCase();
-            if (retry !== 'y') {
-                console.log('Program terminated.');
-                process.exit(1);
-            }
+            return await fn();
+        } catch (e) {
+            lastErr = e;
+            if (i < attempts - 1) await new Promise(res => setTimeout(res, delay));
         }
     }
+    throw lastErr;
+}
 
-    const browser = await puppeteer.launch({
-        headless: true,
+/* ------------------------------------------------------------------
+ * Seat‑checking logic (single polling iteration)
+ * ----------------------------------------------------------------*/
+async function pollOnce(email, transporter, page) {
+    // Ensure term filter is set (selector may change – use robust logic)
+    await page.waitForSelector('#termFilter', { timeout: 60000 });
+    await page.select('#termFilter', termCode);
+
+    // Select Oxford campus (if present)
+    await page.waitForSelector('.ms-choice');
+    await page.click('.ms-choice');
+    await page.waitForTimeout(500);
+    await page.evaluate(() => {
+        const label = [...document.querySelectorAll('label')].find(l => /Oxford/i.test(l.textContent));
+        label?.querySelector('input[type="checkbox"]')?.click();
     });
+    await page.click('body');
+    await page.click('#advancedLink');
 
-    try {
-        const page = await browser.newPage();
-        await page.setDefaultNavigationTimeout(30000);
-        
+    // Iterate monitored CRNs
+    for (const crn of monitor.all) {
+        await page.$eval('#crnNumber', el => (el.value = ''));
+        await page.type('#crnNumber', crn);
+        await page.click('#courseSearch');
+
         try {
-            await page.goto(MIAMI_COURSE_URL, {
-                waitUntil: 'networkidle0'
-            });
-        } catch (error) {
-            console.error('\nERROR: Could not access the course list website.');
-            console.log('Please verify you are connected to Miami\'s network.');
-            throw error;
-        }
-
-        // Setup page filters
-        await page.waitForSelector('#termFilter');
-        await page.select('#termFilter', '202520');
-
-        await page.waitForSelector('.ms-choice');
-        await page.click('.ms-choice');
-
-        await new Promise(resolve => setTimeout(resolve, 1000));
-
-        await page.evaluate(() => {
-            const labels = Array.from(document.querySelectorAll('label'));
-            const oxfordLabel = labels.find(label => label.textContent.includes('Oxford'));
-            if (oxfordLabel) {
-                const checkbox = oxfordLabel.querySelector('input[type="checkbox"]');
-                if (checkbox) checkbox.click();
+            await page.waitForSelector(`#statusMessage${crn}`, { timeout: 7000 });
+            const status = await page.$eval(`#statusMessage${crn}`, el => el.innerText.trim());
+            const [current, max] = status.split('/').map(Number);
+            if (max - current > 0) {
+                const body = `Good news! CRN ${crn} now shows ${current}/${max} enrolled ( ${max - current} open seat(s) ).`;
+                await sendMail(transporter, `Seat available for CRN ${crn}`, body, email);
+                console.log(`Notification sent for CRN ${crn}.`);
+                monitor.delete(crn);
+            } else {
+                console.log(`CRN ${crn}: ${current}/${max}`);
             }
-        });
-
-        await page.click('body');
-        await page.waitForSelector('#advancedLink');
-        await page.click('#advancedLink');
-
-        // Check each CRN
-        for (const crn of monitor.getCRNs()) {
-            await page.$eval('#crnNumber', el => el.value = '');
-            await page.type('#crnNumber', crn.toString());
-            await page.waitForSelector('#courseSearch:not([disabled])');
-            await page.click('#courseSearch');
-
-            try {
-                await page.waitForSelector(`#statusMessage${crn}`, { timeout: 5000 });
-
-                const statusMessage = await page.evaluate((crn) => {
-                    const element = document.querySelector(`#statusMessage${crn}`);
-                    return element ? element.innerText.trim() : null;
-                }, crn);
-
-                if (statusMessage) {
-                    console.log(`\nCRN ${crn} Status: ${statusMessage}`);
-                    const [current, max] = statusMessage.split('/').map(num => parseInt(num));
-                    
-                    if (!isNaN(current) && !isNaN(max)) {
-                        const availableSeats = max - current;
-                        console.log(`Available Seats: ${availableSeats}`);
-                        
-                        if (availableSeats > 0) {
-                            console.log(`Seat available in CRN ${crn}! Sending email notification...`);
-                            await sendEmailNotification(crn, current, max, email);
-                            monitor.courses.delete(crn);
-                        }
-                    }
-                } else {
-                    console.log(`Status message not found for CRN ${crn}`);
-                }
-            } catch (error) {
-                console.error(`Error checking CRN ${crn}:`, error.message);
-                if (error.name === 'TimeoutError') {
-                    console.error('Timeout: Could not find the status message.');
-                    console.log('Possible reasons:');
-                    console.log('1. The course might not exist');
-                    console.log('2. Network connection is slow');
-                    console.log('3. Miami\'s website might be experiencing issues\n');
-                }
-            }
-        }
-
-        if (monitor.courses.size > 0) {
-            console.log('\nChecking again in 2 minutes...');
-            await browser.close();
-            await new Promise(resolve => setTimeout(resolve, CHECK_INTERVAL));
-            return searchCourses(email);
-        } else {
-            console.log('\nAll courses have available seats. Program will now exit.');
-            process.exit(0);
-        }
-
-    } catch (error) {
-        console.error('Error:', error.message);
-        console.log('Retrying in 2 minutes...');
-        await browser.close();
-        await new Promise(resolve => setTimeout(resolve, CHECK_INTERVAL));
-        return searchCourses(email);
-    } finally {
-        if (browser) {
-            await browser.close();
+        } catch (err) {
+            console.error(`CRN ${crn}: failed to read status –`, err.message);
         }
     }
 }
 
-/**
- * @brief Main program entry point
- */
-async function main() {
+/* ------------------------------------------------------------------
+ * Main loop
+ * ----------------------------------------------------------------*/
+async function seatFinder(email) {
+    const transporter = createTransport(email);
+
+    // Send confirmation once
+    if (!monitor.confirmationSent) {
+        const body = `Monitoring CRNs: ${monitor.all.join(', ')}\nPolling every ${CHECK_INTERVAL / 1000}s.`;
+        await sendMail(transporter, 'MU Seat Finder monitoring started', body, email);
+        monitor.confirmationSent = true;
+    }
+
+    browser = await puppeteer.launch(buildLaunchOpts());
+    const page = await browser.newPage();
+    await page.setDefaultNavigationTimeout(45000);
+
+    let running = true;
+    const cleanup = async () => {
+        running = false;
+        if (browser) await browser.close();
+    };
+    process.on('SIGINT', cleanup);
+    process.on('SIGTERM', cleanup);
+
+    while (running && monitor.size) {
+        // Ensure connectivity
+        if (!(await checkMiamiConnection())) {
+            console.error('✖ Not on MU network – waiting 60s and retrying');
+            await new Promise(r => setTimeout(r, 60000));
+            continue;
+        }
+
+        // Load page with retry/back‑off
+        await withRetry(() => page.goto(MIAMI_COURSE_URL, { waitUntil: 'networkidle0' }));
+
+        await pollOnce(email, transporter, page);
+
+        if (monitor.size) {
+            await new Promise(r => setTimeout(r, CHECK_INTERVAL));
+        }
+    }
+
+    console.log('No more CRNs to monitor – exiting.');
+    await cleanup();
+    process.exit(0);
+}
+
+/* ------------------------------------------------------------------
+ * CLI setup & bootstrap
+ * ----------------------------------------------------------------*/
+(async function main() {
     try {
         console.clear();
-        console.log('\n=== Welcome to the MU Course Seat Finder ===\n');
-        console.log('Important Notes:');
-        console.log('1. You must use your Miami University email (@miamioh.edu)');
-        console.log('2. You must be connected to Miami\'s network or VPN');
-        console.log('3. The program will check every 2 minutes until seats are found');
-        console.log('4. Press Ctrl+C at any time to stop the program\n');
+        console.log('\n=== MU Course Seat Finder ===');
 
-        const email = PROMPT('Enter your Miami email (uniqueid@miamioh.edu): ');
-        if (!email.endsWith(MIAMI_EMAIL_DOMAIN)) {
-            throw new Error('Please use a valid Miami University email address.');
-        }
+        // Email
+        const email = PROMPT('Miami email (uniqueid@miamioh.edu): ').trim();
+        if (!email.endsWith(MIAMI_EMAIL_DOMAIN)) throw new Error('Invalid Miami email.');
 
-        let gettingCRNs = true;
-        while (gettingCRNs) {
-            const crn = PROMPT('Enter a course CRN (or press Enter to finish): ').trim();
-            if (crn === '') {
-                if (monitor.courses.size === 0) {
-                    console.log('Please enter at least one CRN.');
-                    continue;
-                }
-                gettingCRNs = false;
-            } else {
-                monitor.addCourse(crn);
-                console.log(`Added CRN ${crn} to monitoring list.`);
+        // Year + term code
+        const year = PROMPT('School year (e.g., 2026 for 2025‑26): ').trim();
+        const termChoice = PROMPT('Term (1:Fall 2:Winter 3:Spring 4:Summer): ').trim();
+        const termMap = Object.freeze({ 1: '10', 2: '15', 3: '20', 4: '30' });
+        if (!termMap[termChoice]) throw new Error('Invalid term.');
+        termCode = `${year}${termMap[termChoice]}`;
+        if (!/^\d{6}$/.test(termCode)) throw new Error('Generated term code must be 6 digits.');
+
+        // CRN input loop
+        while (true) {
+            const crn = PROMPT('Enter CRN (or return to finish): ').trim();
+            if (!crn) {
+                if (monitor.size) break;
+                console.log('Add at least one CRN.');
+                continue;
             }
+            monitor.add(crn);
+            console.log(`Added CRN ${crn}.`);
         }
 
-        const isConnected = await checkMiamiConnection();
-        if (!isConnected) {
-            console.error('\nERROR: Not connected to Miami University network!');
-            console.log('Please connect to:');
-            console.log('1. Miami\'s campus network');
-            console.log('2. Miami\'s VPN');
-            console.log('3. MU-WIRELESS\n');
-            process.exit(1);
+        // Final MU network check
+        if (!(await checkMiamiConnection())) {
+            throw new Error('Not connected to MU network/VPN.');
         }
 
-        console.log('\nStarting seat checker...');
-        console.log('The program will notify you when seats become available.');
-        console.log('You will receive a confirmation email shortly.');
-        console.log('Leave this window open to continue checking.\n');
-
-        await searchCourses(email);
-        
-    } catch (error) {
-        console.error('Error:', error.message);
+        await seatFinder(email);
+    } catch (err) {
+        console.error('Fatal:', err.message);
+        if (browser) await browser.close();
         process.exit(1);
     }
-}
-
-main();
+})();
